@@ -178,6 +178,16 @@ class Container:
         finally:
             await scope.close()
 
+    @staticmethod
+    def _is_collection_type(typ) -> tuple[bool, t.Type | None, type | None]:
+        """Check if typ is list[X] or tuple[X]. Returns (is_collection, inner_type, collection_type)."""
+        origin = t.get_origin(typ)
+        if origin is list or origin is tuple:
+            args = t.get_args(typ)
+            if args:
+                return True, args[0], origin
+        return False, None, None
+
     def extract_depedencies(self, callable_: t.Callable[..., t.Any]):
         signature = Signature.from_callable(callable_)
 
@@ -188,19 +198,102 @@ class Container:
             dependencies[param_name] = param.annotation
         return dependencies
 
+    async def _resolve_provider(
+        self,
+        provider: ServiceProvider,
+        desired_type: t.Type,
+        context: DependencyResolutionContext,
+    ) -> t.Any:
+        concrete_type_or_callable = provider.concrete_type_or_factory
+        lifetime = provider.lifetime
+
+        factory = concrete_type = concrete_type_or_callable
+
+        if not isclass(concrete_type_or_callable) and callable(
+            concrete_type_or_callable
+        ):
+            if is_lambda_function(concrete_type_or_callable):
+                concrete_type = desired_type
+            else:
+                sig = Signature.from_callable(concrete_type_or_callable)
+                if (
+                    not sig.return_annotation
+                    or sig.return_annotation is Signature.empty
+                ):
+                    raise DIException(
+                        "Callable is not a lambda function AND has no return type."
+                    )
+                concrete_type = sig.return_annotation
+
+            factory = concrete_type_or_callable
+
+        # Push the concrete type to the context chain, prevent circular dependency loop.
+        with context(concrete_type, lifetime):
+            if lifetime in ServiceLifetime.ONCE:
+                await provider.lock.acquire()
+                if provider.instance is not None:
+                    provider.lock.release()
+                    return provider.instance
+
+            kwargs = {}
+
+            if isclass(factory):
+                dependencies = self.extract_depedencies(factory.__init__)
+            elif callable(factory):
+                dependencies = self.extract_depedencies(factory)
+            else:
+                dependencies = {}
+
+            for key, typ in dependencies.items():
+                if typ in self.PRIMITIVE_TYPES:
+                    continue
+
+                is_collection, inner_type, collection_type = self._is_collection_type(typ)
+                if is_collection:
+                    resolved = await self._resolve_all(inner_type, context)
+                    if collection_type is tuple:
+                        resolved = tuple(resolved)
+                    kwargs[key] = resolved
+                    continue
+
+                # Check lifetime compatibility before resolving
+                if dependency_providers := self._get_service_definition(typ):
+                    for dep_provider in dependency_providers:
+                        context.check_lifetime_compatibility(dep_provider.base_type, dep_provider.lifetime)
+
+                resolved = await self._resolve(typ, context)
+                if resolved is None:
+                    continue
+                kwargs[key] = resolved
+
+            if iscoroutinefunction(factory):
+                instance = await factory(**kwargs)
+            elif callable(factory):
+                instance = factory(**kwargs)
+                if is_context_manager(instance):
+                    self._pending_ctx_managers.append(instance)
+                    instance = await instance.__aenter__()
+            else:
+                instance = factory
+
+            if lifetime in ServiceLifetime.ONCE:
+                provider.instance = instance
+                provider.lock.release()
+
+            return instance
+
     async def _resolve(
         self,
         desired_type_or_callable: t.Type[T] | t.Callable[..., T],
         context: DependencyResolutionContext,
         strict: bool = True,
-    ) -> T | list[T] | None:
+    ) -> T | None:
 
         if desired_type_or_callable is self.__class__:
             return self  # type: ignore
 
         desired_type = desired_type_or_callable
 
-        # Discover which type is gonna be instantiated.
         providers = self._get_service_definition(desired_type)
 
         if not providers:
@@ -213,82 +306,21 @@ class Container:
                 raise DIException(f"Type {type_name} could not be resolved.")
             return None
 
-        async def _resolve_provider(provider):
+        return await self._resolve_provider(providers[-1], desired_type, context)
 
-            concrete_type_or_callable = provider.concrete_type_or_factory
-            lifetime = provider.lifetime
+    async def _resolve_all(
+        self,
+        desired_type: t.Type[T],
+        context: DependencyResolutionContext,
+    ) -> list[T]:
+        providers = self._get_service_definition(desired_type)
+        if not providers:
+            return []
 
-            factory = concrete_type = concrete_type_or_callable
-
-            if not isclass(concrete_type_or_callable) and callable(
-                concrete_type_or_callable
-            ):
-                if is_lambda_function(concrete_type_or_callable):
-                    concrete_type = desired_type
-                else:
-                    sig = Signature.from_callable(concrete_type_or_callable)
-                    if (
-                        not sig.return_annotation
-                        or sig.return_annotation is Signature.empty
-                    ):
-                        raise DIException(
-                            "Callable is not a lambda function AND has not return type."
-                        )
-                    concrete_type = sig.return_annotation
-
-                factory = concrete_type_or_callable
-
-            # Push the concrete type to the context chain, prevent circular dependency loop.
-            with context(concrete_type, lifetime):
-                if lifetime in ServiceLifetime.ONCE:
-                    await provider.lock.acquire()
-                    if provider.instance is not None:
-                        provider.lock.release()
-                        return provider.instance
-
-                kwargs = {}
-
-                if isclass(factory):
-                    dependencies = self.extract_depedencies(factory.__init__)
-                elif callable(factory):
-                    dependencies = self.extract_depedencies(factory)
-                else:
-                    dependencies = {}
-
-                for key, typ in dependencies.items():
-                    if typ in self.PRIMITIVE_TYPES:
-                        continue
-                    
-                    # Check lifetime compatibility before resolving                    
-                    if dependency_providers := self._get_service_definition(typ):
-                        for dep_provider in dependency_providers:
-                            context.check_lifetime_compatibility(dep_provider.base_type, dep_provider.lifetime)
-                    
-                    resolved = await self._resolve(typ, context)
-                    if resolved is None:
-                        continue
-                    kwargs[key] = resolved
-
-                if iscoroutinefunction(factory):
-                    instance = await factory(**kwargs)
-                elif callable(factory):
-                    instance = factory(**kwargs)
-                    if is_context_manager(instance):
-                        self._pending_ctx_managers.append(instance)
-                        instance = await instance.__aenter__()
-                else:
-                    instance = factory
-
-                if lifetime in ServiceLifetime.ONCE:
-                    provider.instance = instance
-                    provider.lock.release()
-
-                return instance
-
-        if len(providers) > 1:
-            return [await _resolve_provider(provider) for provider in providers]
-
-        return await _resolve_provider(providers[0])
+        return [
+            await self._resolve_provider(provider, desired_type, context)
+            for provider in providers
+        ]
 
     async def get(self, desired_type: t.Type[T]) -> T:
         return await self.resolve(desired_type, True)  # type: ignore
@@ -308,6 +340,14 @@ class Container:
         kwargs = {}
         for key, typ in dependencies.items():
             if typ in self.PRIMITIVE_TYPES:
+                continue
+
+            is_collection, inner_type, collection_type = self._is_collection_type(typ)
+            if is_collection:
+                resolved = await self._resolve_all(inner_type, context)
+                if collection_type is tuple:
+                    resolved = tuple(resolved)
+                kwargs[key] = resolved
                 continue
 
             resolved = await self._resolve(typ, context, strict)
