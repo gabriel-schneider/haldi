@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name='haldi',
-    version='0.3',
+    version='0.4',
     author='Gabriel S. Almeida',
     author_email='gabriel@foxen.com.br',
     description='A simple and efficient Python library for handling dependency injection.',
