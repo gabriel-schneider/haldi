@@ -322,14 +322,22 @@ class Container:
             for provider in providers
         ]
 
-    async def get(self, desired_type: t.Type[T]) -> T:
+    async def get(self, desired_type: t.Type[T]) -> T| t.Sequence[T]:
         return await self.resolve(desired_type, True)  # type: ignore
 
-    async def try_get(self, desired_type: t.Type[T]) -> T | None:
+    async def try_get(self, desired_type: t.Type[T]) -> T | t.Sequence[T] | None:
         return await self.resolve(desired_type, False)
 
-    async def resolve(self, desired_type: t.Type[T], strict: bool = True) -> T | None:
+    async def resolve(self, desired_type: t.Type[T], strict: bool = True) -> T | t.Sequence[T] | None:
         context = DependencyResolutionContext(self)
+
+        is_collection, inner_type, collection_type = self._is_collection_type(desired_type)
+        if is_collection:
+            resolved = await self._resolve_all(inner_type, context) #type: ignore
+            if collection_type is tuple:
+                resolved = tuple(resolved)
+            return resolved
+
         return await self._resolve(desired_type, context, strict)
 
     async def get_executor(
