@@ -1,5 +1,6 @@
 import abc
 import warnings
+from contextlib import asynccontextmanager
 
 from haldi import (
     Container,
@@ -805,3 +806,68 @@ async def test_registering_same_type_twice_appends():
 async def test_close_on_empty_container():
     container = Container()
     await container.close()  # should not raise
+
+
+# ──────────────────────────────────────────────
+# Exception safety: scope + async context manager
+# ──────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_scope_and_context_manager_cleaned_up_on_exception():
+    entered = False
+    exited = False
+
+    class ManagedResource:
+        async def __aenter__(self):
+            nonlocal entered
+            entered = True
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, tb):
+            nonlocal exited
+            exited = True
+
+    container = Container()
+    container.add_scoped(ManagedResource)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        async with container.scoped() as scope:
+            resource = await scope.resolve(ManagedResource)
+            assert entered
+            assert isinstance(resource, ManagedResource)
+            raise RuntimeError("boom")
+
+    assert exited, "context manager __aexit__ was not called after exception"
+    assert scope._pending_ctx_managers == [], "scope did not release pending context managers"
+
+
+@pytest.mark.asyncio
+async def test_scope_and_asynccontextmanager_cleaned_up_on_exception():
+    entered = False
+    exited = False
+
+    class Resource:
+        pass
+
+    @asynccontextmanager
+    async def create_resource():
+        nonlocal entered, exited
+        entered = True
+        try:
+            yield Resource()
+        finally:
+            exited = True
+
+    container = Container()
+    container.register(Resource, lambda: create_resource(), ServiceLifetime.SCOPED)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        async with container.scoped() as scope:
+            resource = await scope.resolve(Resource)
+            assert entered
+            assert isinstance(resource, Resource)
+            raise RuntimeError("boom")
+
+    assert exited, "@asynccontextmanager cleanup was not called after exception"
+    assert scope._pending_ctx_managers == [], "scope did not release pending context managers"
