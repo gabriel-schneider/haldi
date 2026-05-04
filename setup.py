@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name='haldi',
-    version='0.5',
+    version='0.6',
     author='Gabriel S. Almeida',
     author_email='gabriel@foxen.com.br',
     description='A simple and efficient Python library for handling dependency injection.',
@@ -14,7 +14,7 @@ setup(
     url='https://github.com/gabriel-schneider/haldi',
     packages=find_packages(),
     classifiers=[
-        'Development Status :: 3 - Alpha',
+        'Development Status :: 4 - Beta',
         'Intended Audience :: Developers',
         'License :: OSI Approved :: MIT License',
         'Programming Language :: Python :: 3',
