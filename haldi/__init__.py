@@ -198,6 +198,53 @@ class Container:
             dependencies[param_name] = param.annotation
         return dependencies
 
+    async def _instantiate_provider(
+        self,
+        factory: t.Any,
+        context: DependencyResolutionContext,
+    ) -> t.Any:
+        kwargs = {}
+
+        if isclass(factory):
+            dependencies = self.extract_depedencies(factory.__init__)
+        elif callable(factory):
+            dependencies = self.extract_depedencies(factory)
+        else:
+            dependencies = {}
+
+        for key, typ in dependencies.items():
+            if typ in self.PRIMITIVE_TYPES:
+                continue
+
+            is_collection, inner_type, collection_type = self._is_collection_type(typ)
+            if is_collection:
+                resolved = await self._resolve_all(inner_type, context)
+                if collection_type is tuple:
+                    resolved = tuple(resolved)
+                kwargs[key] = resolved
+                continue
+
+            if dependency_providers := self._get_service_definition(typ):
+                for dep_provider in dependency_providers:
+                    context.check_lifetime_compatibility(dep_provider.base_type, dep_provider.lifetime)
+
+            resolved = await self._resolve(typ, context)
+            if resolved is None:
+                continue
+            kwargs[key] = resolved
+
+        if iscoroutinefunction(factory):
+            instance = await factory(**kwargs)
+        elif callable(factory):
+            instance = factory(**kwargs)
+            if is_context_manager(instance):
+                self._pending_ctx_managers.append(instance)
+                instance = await instance.__aenter__()
+        else:
+            instance = factory
+
+        return instance
+
     async def _resolve_provider(
         self,
         provider: ServiceProvider,
@@ -230,57 +277,15 @@ class Container:
         # Push the concrete type to the context chain, prevent circular dependency loop.
         with context(concrete_type, lifetime):
             if lifetime in ServiceLifetime.ONCE:
-                await provider.lock.acquire()
-                if provider.instance is not None:
-                    provider.lock.release()
-                    return provider.instance
+                async with provider.lock:
+                    if provider.instance is not None:
+                        return provider.instance
 
-            kwargs = {}
+                    instance = await self._instantiate_provider(factory, context)
+                    provider.instance = instance
+                    return instance
 
-            if isclass(factory):
-                dependencies = self.extract_depedencies(factory.__init__)
-            elif callable(factory):
-                dependencies = self.extract_depedencies(factory)
-            else:
-                dependencies = {}
-
-            for key, typ in dependencies.items():
-                if typ in self.PRIMITIVE_TYPES:
-                    continue
-
-                is_collection, inner_type, collection_type = self._is_collection_type(typ)
-                if is_collection:
-                    resolved = await self._resolve_all(inner_type, context)
-                    if collection_type is tuple:
-                        resolved = tuple(resolved)
-                    kwargs[key] = resolved
-                    continue
-
-                # Check lifetime compatibility before resolving
-                if dependency_providers := self._get_service_definition(typ):
-                    for dep_provider in dependency_providers:
-                        context.check_lifetime_compatibility(dep_provider.base_type, dep_provider.lifetime)
-
-                resolved = await self._resolve(typ, context)
-                if resolved is None:
-                    continue
-                kwargs[key] = resolved
-
-            if iscoroutinefunction(factory):
-                instance = await factory(**kwargs)
-            elif callable(factory):
-                instance = factory(**kwargs)
-                if is_context_manager(instance):
-                    self._pending_ctx_managers.append(instance)
-                    instance = await instance.__aenter__()
-            else:
-                instance = factory
-
-            if lifetime in ServiceLifetime.ONCE:
-                provider.instance = instance
-                provider.lock.release()
-
-            return instance
+            return await self._instantiate_provider(factory, context)
 
     async def _resolve(
         self,

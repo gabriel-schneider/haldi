@@ -1,4 +1,5 @@
 import abc
+import asyncio
 import warnings
 from contextlib import asynccontextmanager
 
@@ -431,6 +432,36 @@ async def test_singleton_lambda_factory_caches():
     b = await container.resolve(Interface)
     assert a is b
     assert call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_singleton_lock_released_when_resolution_cancelled():
+    started = asyncio.Event()
+    unblock = asyncio.Event()
+    call_count = 0
+
+    async def create_impl() -> Interface:
+        nonlocal call_count
+        call_count += 1
+        started.set()
+        await unblock.wait()
+        return ImplA()
+
+    container = Container()
+    container.register(Interface, create_impl, ServiceLifetime.SINGLETON)
+
+    task = asyncio.create_task(container.resolve(Interface))
+    await started.wait()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    unblock.set()
+
+    instance = await asyncio.wait_for(container.resolve(Interface), timeout=0.5)
+    assert isinstance(instance, ImplA)
+    assert call_count == 2
 
 
 # ──────────────────────────────────────────────
