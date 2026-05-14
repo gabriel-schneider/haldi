@@ -1,5 +1,6 @@
 import abc
 import asyncio
+import typing as t
 import warnings
 from contextlib import asynccontextmanager
 
@@ -78,6 +79,78 @@ async def test_resolve_non_strict_returns_none():
 
     result = await container.resolve(Interface, strict=False)
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_union_resolves_first_declared_branch():
+    class Primary:
+        ...
+
+    class Secondary:
+        ...
+
+    container = Container()
+    container.add_transient(Primary)
+    container.add_transient(Secondary)
+
+    instance = await container.resolve(Primary | Secondary)
+    assert isinstance(instance, Primary)
+
+
+@pytest.mark.asyncio
+async def test_union_falls_back_to_later_branch_when_first_is_missing():
+    class Missing:
+        ...
+
+    class Available:
+        ...
+
+    container = Container()
+    container.add_transient(Available)
+
+    instance = await container.resolve(Missing | Available)
+    assert isinstance(instance, Available)
+
+
+@pytest.mark.asyncio
+async def test_typing_union_resolves_in_declaration_order():
+    class Primary:
+        ...
+
+    class Secondary:
+        ...
+
+    container = Container()
+    container.add_transient(Primary)
+    container.add_transient(Secondary)
+
+    instance = await container.resolve(t.Union[Primary, Secondary])
+    assert isinstance(instance, Primary)
+
+
+@pytest.mark.asyncio
+async def test_optional_union_returns_none_in_strict_mode():
+    class Missing:
+        ...
+
+    container = Container()
+
+    result = await container.resolve(Missing | None)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_union_raises_when_no_branch_resolves():
+    class MissingA:
+        ...
+
+    class MissingB:
+        ...
+
+    container = Container()
+
+    with pytest.raises(DIException, match="could not be resolved"):
+        await container.resolve(MissingA | MissingB)
 
 
 # ──────────────────────────────────────────────
@@ -256,6 +329,47 @@ async def test_list_dependency_single_provider():
     consumer = await container.resolve(Consumer)
     assert len(consumer.impls) == 1
     assert isinstance(consumer.impls[0], ImplA)
+
+
+@pytest.mark.asyncio
+async def test_union_dependency_resolves_first_available_branch():
+    class Primary:
+        ...
+
+    class Secondary:
+        ...
+
+    class Consumer:
+        def __init__(self, dep: Primary | Secondary):
+            self.dep = dep
+
+    container = Container()
+    container.add_transient(Primary)
+    container.add_transient(Secondary)
+    container.add_transient(Consumer)
+
+    consumer = await container.resolve(Consumer)
+    assert isinstance(consumer.dep, Primary)
+
+
+@pytest.mark.asyncio
+async def test_union_dependency_falls_back_to_later_branch():
+    class Missing:
+        ...
+
+    class Available:
+        ...
+
+    class Consumer:
+        def __init__(self, dep: Missing | Available):
+            self.dep = dep
+
+    container = Container()
+    container.add_transient(Available)
+    container.add_transient(Consumer)
+
+    consumer = await container.resolve(Consumer)
+    assert isinstance(consumer.dep, Available)
 
 
 # ──────────────────────────────────────────────
@@ -575,6 +689,25 @@ async def test_get_executor_with_collection():
 
     executor = await container.get_executor(handler)
     assert executor() == 2
+
+
+@pytest.mark.asyncio
+async def test_get_executor_with_union_dependency():
+    class Primary:
+        pass
+
+    class Secondary:
+        pass
+
+    def handler(dep: Primary | Secondary) -> str:
+        return dep.__class__.__name__
+
+    container = Container()
+    container.add_transient(Primary)
+    container.add_transient(Secondary)
+
+    executor = await container.get_executor(handler)
+    assert executor() == "Primary"
 
 
 @pytest.mark.asyncio

@@ -101,6 +101,7 @@ class ServiceProvider:
 
 
 class Container:
+    _UNRESOLVED = object()
     PRIMITIVE_TYPES = (
         str,
         int,
@@ -188,6 +189,102 @@ class Container:
                 return True, args[0], origin
         return False, None, None
 
+    @staticmethod
+    def _is_union_type(typ) -> bool:
+        origin = t.get_origin(typ)
+        return origin in (t.Union, types.UnionType) or isinstance(typ, types.UnionType)
+
+    @staticmethod
+    def _format_type_name(typ: t.Any) -> str:
+        if isinstance(typ, str):
+            return typ
+        return getattr(typ, "__name__", str(typ))
+
+    async def _resolve_annotation(
+        self,
+        annotation: t.Any,
+        context: DependencyResolutionContext,
+        strict: bool = True,
+        check_lifetime_compatibility: bool = False,
+    ) -> t.Any:
+        is_collection, inner_type, collection_type = self._is_collection_type(annotation)
+        if is_collection:
+            resolved = await self._resolve_all(inner_type, context)
+            if collection_type is tuple:
+                return tuple(resolved)
+            return resolved
+
+        if self._is_union_type(annotation):
+            return await self._resolve_union(
+                annotation,
+                context,
+                strict=strict,
+                check_lifetime_compatibility=check_lifetime_compatibility,
+            )
+
+        return await self._resolve_registered_type(
+            annotation,
+            context,
+            strict=strict,
+            check_lifetime_compatibility=check_lifetime_compatibility,
+        )
+
+    async def _resolve_union(
+        self,
+        desired_type: t.Any,
+        context: DependencyResolutionContext,
+        strict: bool = True,
+        check_lifetime_compatibility: bool = False,
+    ) -> t.Any:
+        for branch_type in t.get_args(desired_type):
+            if branch_type is type(None):
+                return None
+
+            resolved = await self._resolve_annotation(
+                branch_type,
+                context,
+                strict=False,
+                check_lifetime_compatibility=check_lifetime_compatibility,
+            )
+            if resolved is not self._UNRESOLVED:
+                return resolved
+
+        if strict:
+            raise DIException(
+                f"Type {self._format_type_name(desired_type)} could not be resolved."
+            )
+
+        return self._UNRESOLVED
+
+    async def _resolve_registered_type(
+        self,
+        desired_type_or_callable: t.Type[T] | t.Callable[..., T],
+        context: DependencyResolutionContext,
+        strict: bool = True,
+        check_lifetime_compatibility: bool = False,
+    ) -> T | object:
+
+        if desired_type_or_callable is self.__class__:
+            return self
+
+        desired_type = desired_type_or_callable
+        providers = self._get_service_definition(desired_type)
+
+        if not providers:
+            if strict:
+                raise DIException(
+                    f"Type {self._format_type_name(desired_type)} could not be resolved."
+                )
+            return self._UNRESOLVED
+
+        provider = providers[-1]
+        resolved = await self._resolve_provider(provider, desired_type, context)
+
+        if check_lifetime_compatibility:
+            context.check_lifetime_compatibility(provider.base_type, provider.lifetime)
+
+        return resolved
+
     def extract_depedencies(self, callable_: t.Callable[..., t.Any]):
         signature = Signature.from_callable(callable_)
 
@@ -216,20 +313,12 @@ class Container:
             if typ in self.PRIMITIVE_TYPES:
                 continue
 
-            is_collection, inner_type, collection_type = self._is_collection_type(typ)
-            if is_collection:
-                resolved = await self._resolve_all(inner_type, context)
-                if collection_type is tuple:
-                    resolved = tuple(resolved)
-                kwargs[key] = resolved
-                continue
-
-            if dependency_providers := self._get_service_definition(typ):
-                for dep_provider in dependency_providers:
-                    context.check_lifetime_compatibility(dep_provider.base_type, dep_provider.lifetime)
-
-            resolved = await self._resolve(typ, context)
-            if resolved is None:
+            resolved = await self._resolve_annotation(
+                typ,
+                context,
+                check_lifetime_compatibility=True,
+            )
+            if resolved is self._UNRESOLVED:
                 continue
             kwargs[key] = resolved
 
@@ -293,25 +382,14 @@ class Container:
         context: DependencyResolutionContext,
         strict: bool = True,
     ) -> T | None:
-
-        if desired_type_or_callable is self.__class__:
-            return self  # type: ignore
-
-        desired_type = desired_type_or_callable
-
-        providers = self._get_service_definition(desired_type)
-
-        if not providers:
-            if strict:
-                type_name = (
-                    desired_type
-                    if isinstance(desired_type, str)
-                    else desired_type.__name__
-                )
-                raise DIException(f"Type {type_name} could not be resolved.")
+        resolved = await self._resolve_registered_type(
+            desired_type_or_callable,
+            context,
+            strict=strict,
+        )
+        if resolved is self._UNRESOLVED:
             return None
-
-        return await self._resolve_provider(providers[-1], desired_type, context)
+        return resolved  # type: ignore
 
     async def _resolve_all(
         self,
@@ -335,15 +413,10 @@ class Container:
 
     async def resolve(self, desired_type: t.Type[T], strict: bool = True) -> T | t.Sequence[T] | None:
         context = DependencyResolutionContext(self)
-
-        is_collection, inner_type, collection_type = self._is_collection_type(desired_type)
-        if is_collection:
-            resolved = await self._resolve_all(inner_type, context) #type: ignore
-            if collection_type is tuple:
-                resolved = tuple(resolved)
-            return resolved
-
-        return await self._resolve(desired_type, context, strict)
+        resolved = await self._resolve_annotation(desired_type, context, strict)
+        if resolved is self._UNRESOLVED:
+            return None
+        return resolved
 
     async def get_executor(
         self, callable_: t.Callable[..., T], strict: bool = True
@@ -355,16 +428,8 @@ class Container:
             if typ in self.PRIMITIVE_TYPES:
                 continue
 
-            is_collection, inner_type, collection_type = self._is_collection_type(typ)
-            if is_collection:
-                resolved = await self._resolve_all(inner_type, context)
-                if collection_type is tuple:
-                    resolved = tuple(resolved)
-                kwargs[key] = resolved
-                continue
-
-            resolved = await self._resolve(typ, context, strict)
-            if resolved is None:
+            resolved = await self._resolve_annotation(typ, context, strict)
+            if resolved is self._UNRESOLVED:
                 continue
 
             kwargs[key] = resolved

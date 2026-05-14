@@ -4,11 +4,14 @@
 
 Async-first dependency injection container for Python. It supports transient, scoped, and singleton lifetimes, resolves constructor (or callable) dependencies via type annotations, and can manage async context managers during resolution.
 
+Requires Python 3.10 or newer.
+
 ## Features
 
 - Async `resolve()` and `get_executor()` APIs
 - Service lifetimes: transient, scoped, singleton
 - Multiple registrations per interface (resolve returns a list)
+- Ordered union resolution for `typing.Union[...]`, `A | B`, and `Optional[T]`
 - Optional lifetime-compatibility warning (singleton depending on scoped)
 - Async context manager support for factories
 
@@ -17,6 +20,8 @@ Async-first dependency injection container for Python. It supports transient, sc
 ```bash
 pip install haldi
 ```
+
+Haldi now targets Python 3.10+.
 
 ## Quick start
 
@@ -75,6 +80,24 @@ container.add_transient(Interface, ImplB)
 
 instances = await container.resolve(Interface)
 ```
+
+## Union annotations
+
+Union-typed dependencies are resolved in declaration order. The first branch that can be resolved wins.
+
+```python
+class Cache:
+	...
+
+class Repository:
+	...
+
+class Service:
+	def __init__(self, dep: Cache | Repository | None):
+		self.dep = dep
+```
+
+If `Cache` is registered, it will be injected. If not, Haldi tries `Repository`. If neither is registered, the final `None` branch is used.
 
 ## Factory registration
 
